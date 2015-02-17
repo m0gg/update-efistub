@@ -1,0 +1,77 @@
+#!/bin/bash
+
+KERNEL="$1"
+P_KERNEL_PATH="${KERNEL:$(expr length `stat --printf="%m" "$KERNEL"`)}"
+EFI_KERNEL_PATH="$(echo $P_KERNEL_PATH | sed 's|/|\\|g')"
+
+OSRELEASE="/etc/os-release"
+GRUBFILE="/etc/default/grub"
+
+. $GRUBFILE
+. $OSRELEASE
+
+
+EFIMGR="efibootmgr"
+ASCIICONV="iconv -f ascii -t ucs2"
+FINDFS="busybox findfs"
+
+LABEL="$NAME EFISTUB"
+
+find_entry() {
+  $EFIMGR | awk "\$0 ~ \"^Boot[0-9]+. $LABEL\" {print \$1}" | egrep -o "[0-9]+"
+}
+
+get_root() {
+  $FINDFS $(awk '$1 !~ "^#" && $2 == "/" {print $1}' /etc/fstab)
+}
+
+get_device_of() {
+  MOUNTPOINT=$(stat --printf="%m" "$1")
+  awk "\$2 == \"$MOUNTPOINT\" {print \$1}" /proc/mounts
+}
+
+get_fs_of() {
+  MOUNTPOINT=$(stat --printf="%m" "$1")
+  awk "\$2 == \"$MOUNTPOINT\" {print \$3}" /proc/mounts
+}
+
+echo_cmdline() {
+  echo "root=$(get_root) ro $GRUB_CMDLINE_LINUX $GRUB_CMDLINE_LINUX_DEFAULT"
+}
+
+echo_binary_args() {
+  echo_cmdline | $ASCIICONV
+}
+
+efi_create() {
+  echo_binary_args | $EFIMGR --create --label="$LABEL" $EFIARGS --append-binary-args -
+}
+
+efi_delete_old() {
+  $EFIMGR -b $ENTRY -B
+}
+
+ENTRY="$(find_entry)"
+
+KERNEL_DEV="$(get_device_of $KERNEL)"
+KERNEL_FS="$(get_fs_of $KERNEL)"
+if [[ $KERNEL_FS != "vfat" ]]; then
+  echo "Filesystem of target kernel is not vfat, it is: $KERNEL_FS"
+  exit 1
+fi
+
+PART="$(echo $KERNEL_DEV | egrep -o "[0-9]+$")"
+BLOCKDEV="${KERNEL_DEV:0:$(($(expr length "$KERNEL_DEV") - $(expr length "$PART") ))}"
+
+EFIARGS="--gpt --disk $BLOCKDEV --part $PART  --loader $EFI_KERNEL_PATH"
+
+if [[ -z "$ENTRY" ]]; then
+  efi_create > /dev/null
+else
+  efi_delete_old > /dev/null
+  efi_create > /dev/null
+fi
+
+$EFIMGR -v
+
+
