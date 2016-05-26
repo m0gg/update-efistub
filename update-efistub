@@ -1,24 +1,79 @@
 #!/bin/bash
 
-KERNEL="$1"
+# Default values
+LABEL="EFISTUB"
+KERNEL_PREFIX="vmlinuz"
+INITRD_PREFIX="initrd.img"
+
+# System config
+EFIMGR="efibootmgr"
+FINDFS="findfs"
+GREP="grep"
+AWK="awk"
+OSRELEASE="/etc/os-release"
+GRUBFILE="/etc/default/grub"
+RESUMEFILE="/etc/initramfs-tools/conf.d/resume"
+
+while getopts ":dk:p:i:" opt; do
+  case $opt in
+    d)
+			DELETE=true
+      ;;
+    k)
+      KV="$OPTARG"
+      ;;
+    p)
+			KERNEL_PREFIX="$OPTARG"
+      ;;
+    i)
+			INITRD_PREFIX="$OPTARG"
+      ;;
+  esac
+done
+shift $((OPTIND-1))
+
+if [ -z "$KV" ]; then
+  KERNEL="$1"
+  INITRD="$2"
+else
+  KERNEL="/boot/${KERNEL_PREFIX}-${KV}"
+  INITRD="/boot/${INITRD_PREFIX}-${KV}"
+fi
+
+if [ ! $DELETE ] && [ ! -e "$KERNEL" ]; then
+  echo "$KERNEL does not exist. Aborting."
+  exit 1;
+fi
+
 P_KERNEL_PATH="${KERNEL:$(expr length `stat --printf="%m" "$KERNEL"`)}"
 EFI_KERNEL_PATH="$(echo $P_KERNEL_PATH | sed 's|/|\\|g')"
 
-OSRELEASE="/etc/os-release"
-GRUBFILE="/etc/default/grub"
+if [ -e "$INITRD" ]; then
+  P_INITRD_PATH="${INITRD:$(expr length `stat --printf="%m" "$INITRD"`)}"
+fi
 
 . $GRUBFILE
 . $OSRELEASE
+. $RESUMEFILE
 
+if [ -n "$PRETTY_NAME" ]; then
+  if [ -n "$KV" ]; then
+    LABEL="$PRETTY_NAME ($KV) EFISTUB"
+  else
+    LABEL="$PRETTY_NAME EFISTUB"
+  fi
+fi
 
-EFIMGR="efibootmgr"
-ASCIICONV="iconv -f ascii -t ucs2"
-FINDFS="busybox findfs"
-
-LABEL="$NAME EFISTUB"
+grep_string_escape() {
+  "${1//$2/\\$2}"
+}
 
 find_entry() {
-  $EFIMGR | awk "\$0 ~ \"^Boot[0-9]+. $LABEL\" {print \$1}" | egrep -o "[0-9]+"
+  SLABEL="${LABEL//\(/\\\(}"
+  SLABEL="${SLABEL//\)/\\\)}"
+  SLABEL="${SLABEL//\[/\\\[}"
+  SLABEL="${SLABEL//\]/\\\]}"
+  $EFIMGR | $GREP -Po "^Boot\K[0-9]+(?=. $SLABEL)"
 }
 
 get_root() {
@@ -27,24 +82,16 @@ get_root() {
 
 get_device_of() {
   MOUNTPOINT=$(stat --printf="%m" "$1")
-  awk "\$2 == \"$MOUNTPOINT\" {print \$1}" /proc/mounts
+  $AWK "\$2 == \"$MOUNTPOINT\" {print \$1}" /proc/mounts
 }
 
 get_fs_of() {
   MOUNTPOINT=$(stat --printf="%m" "$1")
-  awk "\$2 == \"$MOUNTPOINT\" {print \$3}" /proc/mounts
-}
-
-echo_cmdline() {
-  echo "root=$(get_root) ro $GRUB_CMDLINE_LINUX $GRUB_CMDLINE_LINUX_DEFAULT"
-}
-
-echo_binary_args() {
-  echo_cmdline | $ASCIICONV
+  $AWK "\$2 == \"$MOUNTPOINT\" {print \$3}" /proc/mounts
 }
 
 efi_create() {
-  echo_binary_args | $EFIMGR --create --label="$LABEL" $EFIARGS --append-binary-args -
+  $EFIMGR --create --label="$LABEL" $EFIARGS -u "$CMDLINE"
 }
 
 efi_delete_old() {
@@ -55,23 +102,34 @@ ENTRY="$(find_entry)"
 
 KERNEL_DEV="$(get_device_of $KERNEL)"
 KERNEL_FS="$(get_fs_of $KERNEL)"
-if [[ $KERNEL_FS != "vfat" ]]; then
-  echo "Filesystem of target kernel is not vfat, it is: $KERNEL_FS"
+if [ $KERNEL_FS != "vfat" ]; then
+  echo "Filesystem of target kernel is not vfat, it is: $KERNEL_FS. Aborting."
   exit 1
 fi
 
 PART="$(echo $KERNEL_DEV | egrep -o "[0-9]+$")"
 BLOCKDEV="${KERNEL_DEV:0:$(($(expr length "$KERNEL_DEV") - $(expr length "$PART") ))}"
 
-EFIARGS="--gpt --disk $BLOCKDEV --part $PART  --loader $EFI_KERNEL_PATH"
+EFIARGS="--gpt --disk $BLOCKDEV --part $PART --loader $EFI_KERNEL_PATH"
+CMDLINE="root=$(get_root) ro $GRUB_CMDLINE_LINUX $GRUB_CMDLINE_LINUX_DEFAULT"
 
-if [[ -z "$ENTRY" ]]; then
-  efi_create > /dev/null
-else
-  efi_delete_old > /dev/null
-  efi_create > /dev/null
+if [ -n "$P_INITRD_PATH" ]; then
+  CMDLINE="$CMDLINE initrd=$P_INITRD_PATH"
+fi
+if [ -n "$RESUME" ]; then
+  CMDLINE="$CMDLINE resume=$RESUME"
 fi
 
-$EFIMGR -v
-
+if [ $DELETE ]; then
+  if [ -n "$ENTRY" ]; then
+    efi_delete_old > /dev/null
+  fi
+else
+  if [ -z "$ENTRY" ]; then
+    efi_create > /dev/null
+  else
+    efi_delete_old > /dev/null
+    efi_create > /dev/null
+  fi
+fi
 
